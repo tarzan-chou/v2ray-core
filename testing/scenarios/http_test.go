@@ -8,31 +8,30 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
-	"v2ray.com/core/common"
-	"v2ray.com/core/common/buf"
+	"github.com/google/go-cmp/cmp"
 
 	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/serial"
 	"v2ray.com/core/proxy/freedom"
 	v2http "v2ray.com/core/proxy/http"
 	v2httptest "v2ray.com/core/testing/servers/http"
 	"v2ray.com/core/testing/servers/tcp"
-	. "v2ray.com/ext/assert"
 )
 
 func TestHttpConformance(t *testing.T) {
-	assert := With(t)
-
 	httpServerPort := tcp.PickPort()
 	httpServer := &v2httptest.Server{
 		Port:        httpServerPort,
 		PathHandler: make(map[string]http.HandlerFunc),
 	}
 	_, err := httpServer.Start()
-	assert(err, IsNil)
+	common.Must(err)
 	defer httpServer.Close()
 
 	serverPort := tcp.PickPort()
@@ -54,7 +53,8 @@ func TestHttpConformance(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
 	{
 		transport := &http.Transport{
@@ -68,26 +68,80 @@ func TestHttpConformance(t *testing.T) {
 		}
 
 		resp, err := client.Get("http://127.0.0.1:" + httpServerPort.String())
-		assert(err, IsNil)
-		assert(resp.StatusCode, Equals, 200)
+		common.Must(err)
+		if resp.StatusCode != 200 {
+			t.Fatal("status: ", resp.StatusCode)
+		}
 
 		content, err := ioutil.ReadAll(resp.Body)
-		assert(err, IsNil)
-		assert(string(content), Equals, "Home")
+		common.Must(err)
+		if string(content) != "Home" {
+			t.Fatal("body: ", string(content))
+		}
+	}
+}
 
+func TestHttpError(t *testing.T) {
+	tcpServer := tcp.Server{
+		MsgProcessor: func(msg []byte) []byte {
+			return []byte{}
+		},
+	}
+	dest, err := tcpServer.Start()
+	common.Must(err)
+	defer tcpServer.Close()
+
+	time.AfterFunc(time.Second*2, func() {
+		tcpServer.ShouldClose = true
+	})
+
+	serverPort := tcp.PickPort()
+	serverConfig := &core.Config{
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortRange: net.SinglePortRange(serverPort),
+					Listen:    net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&v2http.ServerConfig{}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+			},
+		},
 	}
 
-	CloseAllServers(servers)
+	servers, err := InitializeServerConfigs(serverConfig)
+	common.Must(err)
+	defer CloseAllServers(servers)
+
+	{
+		transport := &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return url.Parse("http://127.0.0.1:" + serverPort.String())
+			},
+		}
+
+		client := &http.Client{
+			Transport: transport,
+		}
+
+		resp, err := client.Get("http://127.0.0.1:" + dest.Port.String())
+		common.Must(err)
+		if resp.StatusCode != 503 {
+			t.Error("status: ", resp.StatusCode)
+		}
+	}
 }
 
 func TestHttpConnectMethod(t *testing.T) {
-	assert := With(t)
-
 	tcpServer := tcp.Server{
 		MsgProcessor: xor,
 	}
 	dest, err := tcpServer.Start()
-	assert(err, IsNil)
+	common.Must(err)
 	defer tcpServer.Close()
 
 	serverPort := tcp.PickPort()
@@ -109,7 +163,8 @@ func TestHttpConnectMethod(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
 	{
 		transport := &http.Transport{
@@ -130,22 +185,20 @@ func TestHttpConnectMethod(t *testing.T) {
 		common.Must(err)
 
 		resp, err := client.Do(req)
-		assert(err, IsNil)
-		assert(resp.StatusCode, Equals, 200)
+		common.Must(err)
+		if resp.StatusCode != 200 {
+			t.Fatal("status: ", resp.StatusCode)
+		}
 
 		content := make([]byte, len(payload))
 		common.Must2(io.ReadFull(resp.Body, content))
-		assert(err, IsNil)
-		assert(content, Equals, xor(payload))
-
+		if r := cmp.Diff(content, xor(payload)); r != "" {
+			t.Fatal(r)
+		}
 	}
-
-	CloseAllServers(servers)
 }
 
 func TestHttpPost(t *testing.T) {
-	assert := With(t)
-
 	httpServerPort := tcp.PickPort()
 	httpServer := &v2httptest.Server{
 		Port: httpServerPort,
@@ -166,7 +219,7 @@ func TestHttpPost(t *testing.T) {
 	}
 
 	_, err := httpServer.Start()
-	assert(err, IsNil)
+	common.Must(err)
 	defer httpServer.Close()
 
 	serverPort := tcp.PickPort()
@@ -188,7 +241,8 @@ func TestHttpPost(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
 	{
 		transport := &http.Transport{
@@ -205,16 +259,17 @@ func TestHttpPost(t *testing.T) {
 		common.Must2(rand.Read(payload))
 
 		resp, err := client.Post("http://127.0.0.1:"+httpServerPort.String()+"/testpost", "application/x-www-form-urlencoded", bytes.NewReader(payload))
-		assert(err, IsNil)
-		assert(resp.StatusCode, Equals, 200)
+		common.Must(err)
+		if resp.StatusCode != 200 {
+			t.Fatal("status: ", resp.StatusCode)
+		}
 
 		content, err := ioutil.ReadAll(resp.Body)
-		assert(err, IsNil)
-		assert(content, Equals, xor(payload))
-
+		common.Must(err)
+		if r := cmp.Diff(content, xor(payload)); r != "" {
+			t.Fatal(r)
+		}
 	}
-
-	CloseAllServers(servers)
 }
 
 func setProxyBasicAuth(req *http.Request, user, pass string) {
@@ -224,15 +279,13 @@ func setProxyBasicAuth(req *http.Request, user, pass string) {
 }
 
 func TestHttpBasicAuth(t *testing.T) {
-	assert := With(t)
-
 	httpServerPort := tcp.PickPort()
 	httpServer := &v2httptest.Server{
 		Port:        httpServerPort,
 		PathHandler: make(map[string]http.HandlerFunc),
 	}
 	_, err := httpServer.Start()
-	assert(err, IsNil)
+	common.Must(err)
 	defer httpServer.Close()
 
 	serverPort := tcp.PickPort()
@@ -258,7 +311,8 @@ func TestHttpBasicAuth(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig)
-	assert(err, IsNil)
+	common.Must(err)
+	defer CloseAllServers(servers)
 
 	{
 		transport := &http.Transport{
@@ -273,34 +327,40 @@ func TestHttpBasicAuth(t *testing.T) {
 
 		{
 			resp, err := client.Get("http://127.0.0.1:" + httpServerPort.String())
-			assert(err, IsNil)
-			assert(resp.StatusCode, Equals, 407)
+			common.Must(err)
+			if resp.StatusCode != 407 {
+				t.Fatal("status: ", resp.StatusCode)
+			}
 		}
 
 		{
 			req, err := http.NewRequest("GET", "http://127.0.0.1:"+httpServerPort.String(), nil)
-			assert(err, IsNil)
+			common.Must(err)
 
 			setProxyBasicAuth(req, "a", "c")
 			resp, err := client.Do(req)
-			assert(err, IsNil)
-			assert(resp.StatusCode, Equals, 407)
+			common.Must(err)
+			if resp.StatusCode != 407 {
+				t.Fatal("status: ", resp.StatusCode)
+			}
 		}
 
 		{
 			req, err := http.NewRequest("GET", "http://127.0.0.1:"+httpServerPort.String(), nil)
-			assert(err, IsNil)
+			common.Must(err)
 
 			setProxyBasicAuth(req, "a", "b")
 			resp, err := client.Do(req)
-			assert(err, IsNil)
-			assert(resp.StatusCode, Equals, 200)
+			common.Must(err)
+			if resp.StatusCode != 200 {
+				t.Fatal("status: ", resp.StatusCode)
+			}
 
 			content, err := ioutil.ReadAll(resp.Body)
-			assert(err, IsNil)
-			assert(string(content), Equals, "Home")
+			common.Must(err)
+			if string(content) != "Home" {
+				t.Fatal("body: ", string(content))
+			}
 		}
 	}
-
-	CloseAllServers(servers)
 }

@@ -18,8 +18,23 @@ type AccessMessage struct {
 	To     interface{}
 	Status AccessStatus
 	Reason interface{}
+	Email  string
 }
 
 func (m *AccessMessage) String() string {
-	return strings.Join([]string{serial.ToString(m.From), string(m.Status), serial.ToString(m.To), serial.ToString(m.Reason)}, " ")
+	builder := strings.Builder{}
+	builder.WriteString(serial.ToString(m.From))
+	builder.WriteByte(' ')
+	builder.WriteString(string(m.Status))
+	builder.WriteByte(' ')
+	builder.WriteString(serial.ToString(m.To))
+	builder.WriteByte(' ')
+	builder.WriteString(serial.ToString(m.Reason))
+
+	if len(m.Email) > 0 {
+		builder.WriteString("email:")
+		builder.WriteString(m.Email)
+		builder.WriteByte(' ')
+	}
+	return builder.String()
 }

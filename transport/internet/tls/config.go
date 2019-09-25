@@ -1,9 +1,12 @@
+// +build !confonly
+
 package tls
 
 import (
-	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"strings"
+	"sync"
 	"time"
 
 	"v2ray.com/core/common/net"
@@ -15,6 +18,8 @@ var (
 	globalSessionCache = tls.NewLRUClientSessionCache(128)
 )
 
+const exp8357 = "experiment:8357"
+
 // ParseCertificate converts a cert.Certificate to Certificate.
 func ParseCertificate(c *cert.Certificate) *Certificate {
 	certPEM, keyPEM := c.ToPEM()
@@ -24,22 +29,17 @@ func ParseCertificate(c *cert.Certificate) *Certificate {
 	}
 }
 
-func (c *Config) GetCertPool() *x509.CertPool {
-	pool, err := x509.SystemCertPool()
-	if err != nil {
-		newError("failed to get system cert pool.").Base(err).WriteToLog()
-		return nil
-	}
-	if pool != nil {
-		for _, cert := range c.Certificate {
-			if cert.Usage == Certificate_AUTHORITY_VERIFY {
-				pool.AppendCertsFromPEM(cert.Certificate)
-			}
+func (c *Config) loadSelfCertPool() (*x509.CertPool, error) {
+	root := x509.NewCertPool()
+	for _, cert := range c.Certificate {
+		if !root.AppendCertsFromPEM(cert.Certificate) {
+			return nil, newError("failed to append cert").AtWarning()
 		}
 	}
-	return pool
+	return root, nil
 }
 
+// BuildCertificates builds a list of TLS certificates from proto definition.
 func (c *Config) BuildCertificates() []tls.Certificate {
 	certs := make([]tls.Certificate, 0, len(c.Certificate))
 	for _, entry := range c.Certificate {
@@ -57,8 +57,14 @@ func (c *Config) BuildCertificates() []tls.Certificate {
 }
 
 func isCertificateExpired(c *tls.Certificate) bool {
+	if c.Leaf == nil && len(c.Certificate) > 0 {
+		if pc, err := x509.ParseCertificate(c.Certificate[0]); err == nil {
+			c.Leaf = pc
+		}
+	}
+
 	// If leaf is not there, the certificate is probably not used yet. We trust user to provide a valid certificate.
-	return c.Leaf != nil && c.Leaf.NotAfter.After(time.Now().Add(-time.Minute))
+	return c.Leaf != nil && c.Leaf.NotAfter.Before(time.Now().Add(-time.Minute))
 }
 
 func issueCertificate(rawCA *Certificate, domain string) (*tls.Certificate, error) {
@@ -75,10 +81,102 @@ func issueCertificate(rawCA *Certificate, domain string) (*tls.Certificate, erro
 	return &cert, err
 }
 
+func (c *Config) getCustomCA() []*Certificate {
+	certs := make([]*Certificate, 0, len(c.Certificate))
+	for _, certificate := range c.Certificate {
+		if certificate.Usage == Certificate_AUTHORITY_ISSUE {
+			certs = append(certs, certificate)
+		}
+	}
+	return certs
+}
+
+func getGetCertificateFunc(c *tls.Config, ca []*Certificate) func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var access sync.RWMutex
+
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		domain := hello.ServerName
+		certExpired := false
+
+		access.RLock()
+		certificate, found := c.NameToCertificate[domain]
+		access.RUnlock()
+
+		if found {
+			if !isCertificateExpired(certificate) {
+				return certificate, nil
+			}
+			certExpired = true
+		}
+
+		if certExpired {
+			newCerts := make([]tls.Certificate, 0, len(c.Certificates))
+
+			access.Lock()
+			for _, certificate := range c.Certificates {
+				if !isCertificateExpired(&certificate) {
+					newCerts = append(newCerts, certificate)
+				}
+			}
+
+			c.Certificates = newCerts
+			access.Unlock()
+		}
+
+		var issuedCertificate *tls.Certificate
+
+		// Create a new certificate from existing CA if possible
+		for _, rawCert := range ca {
+			if rawCert.Usage == Certificate_AUTHORITY_ISSUE {
+				newCert, err := issueCertificate(rawCert, domain)
+				if err != nil {
+					newError("failed to issue new certificate for ", domain).Base(err).WriteToLog()
+					continue
+				}
+
+				access.Lock()
+				c.Certificates = append(c.Certificates, *newCert)
+				issuedCertificate = &c.Certificates[len(c.Certificates)-1]
+				access.Unlock()
+				break
+			}
+		}
+
+		if issuedCertificate == nil {
+			return nil, newError("failed to create a new certificate for ", domain)
+		}
+
+		access.Lock()
+		c.BuildNameToCertificate()
+		access.Unlock()
+
+		return issuedCertificate, nil
+	}
+}
+
+func (c *Config) IsExperiment8357() bool {
+	return strings.HasPrefix(c.ServerName, exp8357)
+}
+
+func (c *Config) parseServerName() string {
+	if c.IsExperiment8357() {
+		return c.ServerName[len(exp8357):]
+	}
+
+	return c.ServerName
+}
+
+// GetTLSConfig converts this Config into tls.Config.
 func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
+	root, err := c.getCertPool()
+	if err != nil {
+		newError("failed to load system root certificate").AtError().Base(err).WriteToLog()
+	}
+
 	config := &tls.Config{
-		ClientSessionCache: globalSessionCache,
-		RootCAs:            c.GetCertPool(),
+		ClientSessionCache:     globalSessionCache,
+		RootCAs:                root,
+		SessionTicketsDisabled: c.DisableSessionResumption,
 	}
 	if c == nil {
 		return config
@@ -88,59 +186,40 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 		opt(config)
 	}
 
+	if !c.AllowInsecureCiphers && len(config.CipherSuites) == 0 {
+		config.CipherSuites = []uint16{
+			tls.TLS_AES_128_GCM_SHA256,
+			tls.TLS_AES_256_GCM_SHA384,
+			tls.TLS_CHACHA20_POLY1305_SHA256,
+
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+		}
+	}
+
 	config.InsecureSkipVerify = c.AllowInsecure
 	config.Certificates = c.BuildCertificates()
 	config.BuildNameToCertificate()
-	config.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		domain := hello.ServerName
-		certExpired := false
-		if certificate, found := config.NameToCertificate[domain]; found {
-			if !isCertificateExpired(certificate) {
-				return certificate, nil
-			}
-			certExpired = true
-		}
 
-		if certExpired {
-			newCerts := make([]tls.Certificate, 0, len(config.Certificates))
-
-			for _, certificate := range config.Certificates {
-				if !isCertificateExpired(&certificate) {
-					newCerts = append(newCerts, certificate)
-				}
-			}
-
-			config.Certificates = newCerts
-		}
-
-		var issuedCertificate *tls.Certificate
-
-		// Create a new certificate from existing CA if possible
-		for _, rawCert := range c.Certificate {
-			if rawCert.Usage == Certificate_AUTHORITY_ISSUE {
-				newCert, err := issueCertificate(rawCert, domain)
-				if err != nil {
-					newError("failed to issue new certificate for ", domain).Base(err).WriteToLog()
-					continue
-				}
-
-				config.Certificates = append(config.Certificates, *newCert)
-				issuedCertificate = &config.Certificates[len(config.Certificates)-1]
-				break
-			}
-		}
-
-		if issuedCertificate == nil {
-			return nil, newError("failed to create a new certificate for ", domain)
-		}
-
-		config.BuildNameToCertificate()
-
-		return issuedCertificate, nil
+	caCerts := c.getCustomCA()
+	if len(caCerts) > 0 {
+		config.GetCertificate = getGetCertificateFunc(config, caCerts)
 	}
-	if len(c.ServerName) > 0 {
-		config.ServerName = c.ServerName
+
+	if sn := c.parseServerName(); len(sn) > 0 {
+		config.ServerName = sn
 	}
+
 	if len(c.NextProtocol) > 0 {
 		config.NextProtos = c.NextProtocol
 	}
@@ -151,16 +230,19 @@ func (c *Config) GetTLSConfig(opts ...Option) *tls.Config {
 	return config
 }
 
+// Option for building TLS config.
 type Option func(*tls.Config)
 
+// WithDestination sets the server name in TLS config.
 func WithDestination(dest net.Destination) Option {
 	return func(config *tls.Config) {
-		if dest.Address.Family().IsDomain() && len(config.ServerName) == 0 {
+		if dest.Address.Family().IsDomain() && config.ServerName == "" {
 			config.ServerName = dest.Address.Domain()
 		}
 	}
 }
 
+// WithNextProto sets the ALPN values in TLS config.
 func WithNextProto(protocol ...string) Option {
 	return func(config *tls.Config) {
 		if len(config.NextProtos) == 0 {
@@ -169,12 +251,12 @@ func WithNextProto(protocol ...string) Option {
 	}
 }
 
-func ConfigFromContext(ctx context.Context) *Config {
-	securitySettings := internet.SecuritySettingsFromContext(ctx)
-	if securitySettings == nil {
+// ConfigFromStreamSettings fetches Config from stream settings. Nil if not found.
+func ConfigFromStreamSettings(settings *internet.MemoryStreamConfig) *Config {
+	if settings == nil {
 		return nil
 	}
-	config, ok := securitySettings.(*Config)
+	config, ok := settings.SecuritySettings.(*Config)
 	if !ok {
 		return nil
 	}
